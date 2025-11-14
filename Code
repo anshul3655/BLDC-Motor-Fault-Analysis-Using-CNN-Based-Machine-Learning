@@ -1,0 +1,299 @@
+
+import os
+import random
+import collections
+import numpy as np
+import cv2
+from sklearn.preprocessing import LabelEncoder
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import classification_report, confusion_matrix
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers
+from tensorflow.keras.applications import InceptionV3
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+
+# ----------------------
+# Configuration
+# ----------------------
+DATA_DIRECTORY = "/content/drive/MyDrive/Data"  # change if needed
+OPERATING_CONDITIONS = ["OC1", "OC2", "OC3", "OC4", "OC5"]
+FAULT_CATEGORIES = ["faulta", "faultb", "faultc", "healthy"]
+TARGET_SIZE = (224, 224)
+BATCH_SIZE = 32
+TOTAL_EPOCHS = 24
+SEED = 1234
+MISCLASS_DIR = "misclassified_examples"
+os.makedirs(MISCLASS_DIR, exist_ok=True)
+
+# ----------------------
+# Utilities & Seeds
+# ----------------------
+def set_global_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+set_global_seed()
+
+def print_sample_counts(data_root, oc_list, class_list):
+    print("Per-OC per-class sample counts:")
+    for oc in oc_list:
+        print(f"  {oc}:")
+        for cls in class_list:
+            path = os.path.join(data_root, oc, cls)
+            cnt = 0
+            if os.path.isdir(path):
+                cnt = len([f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))])
+            print(f"    {cls}: {cnt}")
+    print()
+
+# ----------------------
+# Data handler
+# ----------------------
+class ImageDataHandler:
+    def __init__(self, target_size=TARGET_SIZE, normalization_factor=255.0):
+        self.target_size = target_size
+        self.normalization_factor = normalization_factor
+
+    def read_images_from_directory(self, dir_path, category_label):
+        images_list, labels_list = [], []
+        if not os.path.isdir(dir_path):
+            return np.empty((0, *self.target_size, 3), dtype=np.float32), np.array([], dtype=object)
+        for file in sorted(os.listdir(dir_path)):
+            complete_path = os.path.join(dir_path, file)
+            if not os.path.isfile(complete_path):
+                continue
+            image = cv2.imread(complete_path)
+            if image is None:
+                continue
+            resized = cv2.resize(image, self.target_size)
+            normalized = resized.astype('float32') / self.normalization_factor
+            images_list.append(normalized[..., ::-1])  # BGR->RGB
+            labels_list.append(category_label)
+        if len(images_list) == 0:
+            return np.empty((0, *self.target_size, 3), dtype=np.float32), np.array([], dtype=object)
+        return np.stack(images_list, axis=0), np.array(labels_list, dtype=object)
+
+# ----------------------
+# Model trainer
+# ----------------------
+class TransferLearningModel:
+    def __init__(self, img_shape=(224,224,3), n_classes=4):
+        self.img_shape = img_shape
+        self.n_classes = n_classes
+        self.trained_model = None
+        self.base_model = None
+
+    def build_architecture(self):
+        # Load base and keep reference
+        self.base_model = InceptionV3(weights='imagenet', include_top=False, input_shape=self.img_shape)
+        for layer in self.base_model.layers:
+            layer.trainable = False
+
+        inp = layers.Input(shape=self.img_shape)
+        # Augmentation (active only during training)
+        augmentation = tf.keras.Sequential([
+            layers.RandomFlip("horizontal_and_vertical"),
+            layers.RandomRotation(0.08),
+            layers.RandomZoom(0.08),
+            layers.RandomTranslation(0.06, 0.06),
+            layers.RandomContrast(0.08),
+        ], name="augmentation")
+
+        x = augmentation(inp)
+        x = self.base_model(x, training=False)
+        x = layers.GlobalAveragePooling2D()(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dense(256, activation='relu', kernel_initializer='he_normal')(x)
+        x = layers.Dropout(0.5)(x)
+        out = layers.Dense(self.n_classes, activation='softmax')(x)
+
+        model = models.Model(inputs=inp, outputs=out)
+        model.compile(optimizer=optimizers.Adam(learning_rate=1e-3),
+                      loss='sparse_categorical_crossentropy',
+                      metrics=['accuracy'])
+        return model
+
+    def execute_training(self, train_data, train_labels, val_data, val_labels,
+                        fold_identifier, total_epochs=TOTAL_EPOCHS, batch_sz=BATCH_SIZE,
+                        class_weight=None):
+        self.trained_model = self.build_architecture()
+
+        # Callbacks
+        checkpoint_file = f"model_weights_{fold_identifier}.h5"
+        callbacks = [
+            EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-7, verbose=1),
+            ModelCheckpoint(checkpoint_file, monitor='val_accuracy', save_best_only=True, mode='max', verbose=1)
+        ]
+
+        # Stage 1: train head
+        epochs_stage1 = max(1, int(total_epochs * 0.6))
+        history1 = self.trained_model.fit(
+            train_data, train_labels,
+            batch_size=batch_sz,
+            epochs=epochs_stage1,
+            validation_data=(val_data, val_labels),
+            callbacks=callbacks,
+            shuffle=True,
+            verbose=1,
+            class_weight=class_weight
+        )
+
+        # Stage 2: fine-tune last layers of base
+        if self.base_model is not None:
+            # unfreeze last N layers of base
+            N = 50
+            for layer in self.base_model.layers[-N:]:
+                layer.trainable = True
+        else:
+            # fallback: unfreeze last few layers of whole model
+            for layer in self.trained_model.layers[-30:]:
+                layer.trainable = True
+
+        self.trained_model.compile(optimizer=optimizers.Adam(learning_rate=1e-5),
+                                   loss='sparse_categorical_crossentropy',
+                                   metrics=['accuracy'])
+
+        epochs_stage2 = max(1, total_epochs - epochs_stage1)
+        history2 = self.trained_model.fit(
+            train_data, train_labels,
+            batch_size=batch_sz,
+            epochs=epochs_stage2,
+            validation_data=(val_data, val_labels),
+            callbacks=callbacks,
+            shuffle=True,
+            verbose=1,
+            class_weight=class_weight
+        )
+
+        val_loss, val_acc = self.trained_model.evaluate(val_data, val_labels, verbose=0)
+        return (history1, history2), val_acc, checkpoint_file
+
+# ----------------------
+# CV Pipeline
+# ----------------------
+class CrossValidationPipeline:
+    def __init__(self, data_root, oc_list, class_list):
+        self.data_root = data_root
+        self.oc_list = oc_list
+        self.class_list = class_list
+        self.data_handler = ImageDataHandler()
+        self.label_enc = LabelEncoder()
+
+    def prepare_fold_data(self, held_out_oc):
+        train_images, train_targets = [], []
+        test_images, test_targets = [], []
+        for oc in self.oc_list:
+            for cls in self.class_list:
+                data_path = os.path.join(self.data_root, oc, cls)
+                imgs, lbls = self.data_handler.read_images_from_directory(data_path, cls)
+                if imgs.shape[0] == 0:
+                    continue
+                if oc == held_out_oc:
+                    test_images.append(imgs)
+                    test_targets.append(lbls)
+                else:
+                    train_images.append(imgs)
+                    train_targets.append(lbls)
+
+        if len(train_images) == 0 or len(test_images) == 0:
+            raise ValueError(f"Empty training or testing set for held_out_oc={held_out_oc}")
+
+        X_tr = np.concatenate(train_images, axis=0)
+        y_tr = np.concatenate(train_targets, axis=0)
+        X_te = np.concatenate(test_images, axis=0)
+        y_te = np.concatenate(test_targets, axis=0)
+        return X_tr, y_tr, X_te, y_te
+
+    def run_cross_validation(self):
+        accuracy_scores, best_acc, best_saved_model = [], 0.0, None
+        print("=" * 60)
+        print("Starting Leave-One-OC-Out Cross Validation")
+        print("=" * 60)
+
+        print_sample_counts(self.data_root, self.oc_list, self.class_list)
+
+        for fold_idx, test_fold in enumerate(self.oc_list, start=1):
+            print(f"\n{'='*60}")
+            print(f"Fold {fold_idx}: Holding out {test_fold} for testing")
+            print(f"{'='*60}\n")
+            # prepare
+            X_tr, y_tr, X_te, y_te = self.prepare_fold_data(test_fold)
+            # encode
+            y_tr_encoded = self.label_enc.fit_transform(y_tr)  # fit on training only
+            y_te_encoded = self.label_enc.transform(y_te)
+            num_cls = len(self.label_enc.classes_)
+            print(f"Number of classes (detected): {num_cls}, classes: {self.label_enc.classes_}")
+            print(f"Train samples: {X_tr.shape[0]}, Test samples: {X_te.shape[0]}")
+
+            # class weights
+            classes = np.unique(y_tr_encoded)
+            weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_tr_encoded)
+            class_weight_dict = {int(c): float(w) for c, w in zip(classes, weights)}
+            print("Class weights:", class_weight_dict)
+
+            # train
+            model_trainer = TransferLearningModel(img_shape=(*TARGET_SIZE, 3), n_classes=num_cls)
+            hist, acc_score, ckpt_path = model_trainer.execute_training(
+                X_tr, y_tr_encoded, X_te, y_te_encoded, test_fold,
+                total_epochs=TOTAL_EPOCHS, batch_sz=BATCH_SIZE, class_weight=class_weight_dict
+            )
+
+            print(f"\nResults for {test_fold}: Accuracy = {acc_score * 100:.2f}%")
+            # predictions & diagnostics
+            preds_prob = model_trainer.trained_model.predict(X_te, batch_size=BATCH_SIZE, verbose=0)
+            predictions = np.argmax(preds_prob, axis=1)
+
+            print("\n--- Detailed Classification Report ---")
+            print(classification_report(y_te_encoded, predictions, target_names=self.label_enc.classes_, digits=4))
+
+            cm = confusion_matrix(y_te_encoded, predictions)
+            print("Confusion matrix:\n", cm)
+            per_class_acc = np.zeros(num_cls)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                totals = cm.sum(axis=1)
+                per_class_acc = np.divide(cm.diagonal(), totals, out=np.zeros_like(cm.diagonal(), dtype=float), where=totals!=0)
+            for cls_name, acc in zip(self.label_enc.classes_, per_class_acc):
+                print(f"  {cls_name}: {acc*100:.2f}%")
+
+            # save some misclassified images for manual inspection
+            mis_idx = np.where(predictions != y_te_encoded)[0]
+            print(f"Misclassified examples in fold {test_fold}: {len(mis_idx)}. Saving up to 30 for review.")
+            for i in mis_idx[:30]:
+                img = (X_te[i] * 255).astype(np.uint8)[..., ::-1]  # convert back to BGR for cv2.imwrite
+                fname = f"{MISCLASS_DIR}/mis_{test_fold}_idx{i}_pred{predictions[i]}_true{y_te_encoded[i]}.png"
+                cv2.imwrite(fname, img)
+
+            accuracy_scores.append(acc_score)
+            if acc_score > best_acc:
+                best_acc = acc_score
+                best_saved_model = ckpt_path
+
+        return accuracy_scores, best_acc, best_saved_model
+
+# ----------------------
+# Main
+# ----------------------
+if __name__ == "__main__":
+    set_global_seed(SEED)
+    cv_pipeline = CrossValidationPipeline(
+        data_root=DATA_DIRECTORY,
+        oc_list=OPERATING_CONDITIONS,
+        class_list=FAULT_CATEGORIES
+    )
+
+    results, top_accuracy, top_model_path = cv_pipeline.run_cross_validation()
+    print("\n" + "=" * 60)
+    print("CROSS-VALIDATION SUMMARY")
+    print("=" * 60)
+    print(f"Mean Accuracy Across All Folds: {np.mean(results) * 100:.2f}%")
+    print(f"Standard Deviation: {np.std(results) * 100:.2f}%")
+    print(f"Best Performing Fold Accuracy: {top_accuracy * 100:.2f}%")
+    print(f"Best Model Saved At: {top_model_path}")
+    print(f"\nIndividual Fold Accuracies:")
+    for idx, acc in enumerate(results, 1):
+        print(f"  Fold {idx}: {acc * 100:.2f}%")
+    print("=" * 60)
+
