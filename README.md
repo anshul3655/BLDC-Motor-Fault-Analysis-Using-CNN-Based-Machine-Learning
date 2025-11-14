@@ -1,0 +1,1 @@
+# BLDC-Motor-Fault-Analysis-Using-CNN-Based-Machine-Learning
